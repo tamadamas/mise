@@ -27,6 +27,7 @@ pub enum BackendType {
     Spm,
     Ubi,
     Vfox,
+    Zig,
     Unknown,
 }
 
