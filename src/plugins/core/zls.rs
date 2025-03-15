@@ -22,7 +22,7 @@ pub struct ZlsPlugin {
     ba: BackendArg,
 }
 
-const MINISIGN_KEY: &str = "RWR+9B91GBZ0zOjh6Lr17+zKf5BoSuFvrx2xSeDE57uIYvnKBGmMjOex"
+const MINISIGN_KEY: &str = "RWR+9B91GBZ0zOjh6Lr17+zKf5BoSuFvrx2xSeDE57uIYvnKBGmMjOex";
 
 impl ZlsPlugin {
     pub fn new() -> Self {
@@ -39,48 +39,47 @@ impl ZlsPlugin {
         }
     }
    
-    fn bin_version(&self, bin_name: &str, ctx: &InstallContext, tv: &ToolVersion) -> Result<()> {
-        ctx.pr.set_message((bin_name + "version").into());
-        CmdLineRunner::new(self.bin_path(bin_name, tv))
+    fn bin_version(&self, bin_name: &str, ctx: &InstallContext, tv: &ToolVersion) -> Result<String> {
+        ctx.pr.set_message((bin_name.to_owned() + " version").into());
+        let output = CmdLineRunner::new(self.bin_path(bin_name, tv))
             .with_pr(&ctx.pr)
             .arg("version")
-            .execute()
+            .output()?;
+            
+        // Extract version from output
+        let version = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_string();
+            
+        Ok(version)
     }
 
     fn download(&self, ctx: &InstallContext, tv: &ToolVersion) -> Result<PathBuf> {
-        let archive_ext = if cfg!(target_os = "windows") {
-            "zip"
+        let zls_version = if tv.version == "ref:zig" {
+            // Get the installed Zig version using mise
+            let zig_version = ctx.toolset
+                .get_tool("zig")?
+                .current_version()?
+                .ok_or_else(|| eyre::eyre!("Zig is not installed"))?
+                .version
+                .clone();
+            zig_version
         } else {
-            "tar.xz"
+            tv.version.clone()
         };
 
-        let url = if tv.version == "ref:zig" {
-            format!(
-                "",
-                os(),
-                arch(),
-                self.get_version_from_zig?(tv, &ctx.pr)
-            )
-        } else {
-            ""
-        }
-         else {
-        //     format!(
-        //         "https://ziglang.org/download/{}/zig-{}-{}-{}.{archive_ext}",
-        //         tv.version,
-        //         os(),
-        //         arch(),
-        //         tv.version
-        //     )
-        // };
+        let url = self.fetch_url_from_zigtools(&zls_version)?;
 
-        let filename = url.split('/').next_back().unwrap();
+        let filename = url.split('/').last().unwrap();
         let tarball_path = tv.download_path().join(filename);
 
-        pr.set_message(format!("download {filename}"));
-        HTTP.download_file(&url, &tarball_path, Some(pr))?;
+        ctx.pr.set_message(format!("download {filename}"));
+        HTTP.download_file(&url, &tarball_path, Some(&ctx.pr))?;
 
-        pr.set_message(format!("minisign {filename}"));
+        ctx.pr.set_message(format!("minisign {filename}"));
         let tarball_data = file::read(&tarball_path)?;
         let sig = HTTP.get_text(format!("{url}.minisig"))?;
         minisign::verify(MINISIGN_KEY, &tarball_data, &sig)?;
@@ -111,20 +110,34 @@ impl ZlsPlugin {
     }
 
     fn verify(&self, ctx: &InstallContext, tv: &ToolVersion) -> Result<()> {
-        self.bin_version("zls", ctx, tv)
+        let version = self.bin_version("zls", ctx, tv)?;
+        ctx.pr.set_message(format!("verified zls {}", version));
+        Ok(())
     }
 
-    fn get_version_from_zig(&self, ctx: &InstallContext, tv: &ToolVersion) -> Result<String> {
-        let json_url = format!("https://releases.zigtools.org/v1/zls/select-version?zig_version={}&compatibility=only-runtime", self.bin_version("zig", ctx, tv))
+    fn fetch_url_from_zigtools(&self, zls_version: &str) -> Result<String> {
+        let json_url = format!("https://releases.zigtools.org/v1/zls/select-version?zig_version={}&compatibility=only-runtime", zls_version);
 
         let version_json: serde_json::Value = HTTP_FETCH.json(json_url)?;
-        print!("version_json: {}", version_json)
-
-        // let zls_version = version_json
-        //     .pointer(&format!("/{key}/version"))
-        //     .and_then(|v| v.as_str())
-        //     .ok_or_else(|| eyre::eyre!("Failed to get zls version from {:?}", json_url))?;
-        // Ok(zls_version.to_string())
+        
+        // Check if there's an error code in the response
+        if let Some(code) = version_json.get("code") {
+            let message = version_json["message"].as_str().unwrap_or("Unknown error");
+            return Err(eyre::eyre!("ZLS API error (code {}): {}", code, message));
+        }
+        
+        // Get the appropriate tarball URL based on OS and architecture
+        let os_key = format!("{}-{}", os(), arch());
+        
+        if let Some(platform) = version_json.get(&os_key) {
+            if let Some(tarball) = platform.get("tarball") {
+                if let Some(url) = tarball.as_str() {
+                    return Ok(url.to_string());
+                }
+            }
+        }
+        
+        Err(eyre::eyre!("No compatible ZLS build found for {} on {}", zls_version, os_key))
     }
 }
 
@@ -133,16 +146,18 @@ impl Backend for ZlsPlugin {
         &self.ba
     }
 
-    fn _list_remote_versions(&self) -> Result<Vec<String>> {
-        print!("Check versions")
-        // let versions: Vec<String> = github::list_releases("zigtools/zls")?
-        //     .into_iter()
-        //     .map(|r| r.tag_name)
-        //     .unique()
-        //     .sorted_by_cached_key(|s| (Versioning::new(s), s.to_string()))
-        //     .collect();
-        // Ok(versions)
-        OK("")
+    fn list_remote_versions(&self) -> Result<Vec<String>> {
+        let mut versions: Vec<String> = github::list_releases("zigtools/zls")?
+            .into_iter()
+            .map(|r| r.tag_name)
+            .unique()
+            .sorted_by_cached_key(|s| (Versioning::new(s), s.to_string()))
+            .collect();
+            
+        // Add special "ref:zig" version that matches installed Zig version
+        versions.push("ref:zig".to_string());
+        
+        Ok(versions)
     }
 
     fn list_bin_paths(&self, tv: &ToolVersion) -> Result<Vec<PathBuf>> {
@@ -153,14 +168,13 @@ impl Backend for ZlsPlugin {
         }
     }
 
-    fn idiomatic_filenames(&self) -> Result {
-        Ok()
+    fn idiomatic_install_path(&self, _tv: &ToolVersion) -> Result<()> {
+        Ok(())
     }
 
     #[requires(matches!(tv.request, ToolRequest::Version { .. } | ToolRequest::Prefix { .. } | ToolRequest::Ref { .. }), "unsupported tool version request type")]
-    fn install_version_(&self, ctx: &InstallContext, mut tv: ToolVersion) -> Result<ToolVersion> {
-        let tarball_path = self.download(&tv, &ctx.pr)?;
-        self.verify_checksum(ctx, &mut tv, &tarball_path)?;
+    fn install_version_(&self, ctx: &InstallContext, tv: ToolVersion) -> Result<ToolVersion> {
+        let tarball_path = self.download(ctx, &tv)?;
         self.install(ctx, &tv, &tarball_path)?;
         self.verify(ctx, &tv)?;
         Ok(tv)
